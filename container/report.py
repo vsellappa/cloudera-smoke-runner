@@ -168,19 +168,49 @@ def html_report(r: dict) -> str:
     ds_subtitle = (f' · Data Services: <b>{_h.escape(ds_cluster)}</b>'
                    + (f' (PvC {_h.escape(ds_version)})' if ds_version else '')) if ds_cluster else ''
     n_svc = len(r.get("base_cluster_services", []))
-    # Headline summary text — derived
+    # Rich headline summary — combines base-cluster state, DS issues, host/disk
+    # utilization, and CLI-test context.
+    cluster_name = cm.get("cluster_name","")
     headline_bits = []
-    fail_n = c.get("FAIL", 0); warn_n = c.get("WARN", 0)
-    if fail_n == 0 and warn_n == 0:
-        headline_bits.append(f"<b>{_h.escape(cm.get('cluster_name',''))}</b> is fully healthy — all {n_svc} services STARTED + GOOD.")
-    elif fail_n == 0:
-        headline_bits.append(f"<b>{_h.escape(cm.get('cluster_name',''))}</b> is operational with {warn_n} WARN(s).")
+
+    # Base cluster health line
+    base_svcs = r.get("base_cluster_services", [])
+    base_ok   = sum(1 for s in base_svcs if s["verdict"]=="PASS")
+    base_warn = [s for s in base_svcs if s["verdict"]=="WARN"]
+    base_fail = [s for s in base_svcs if s["verdict"]=="FAIL"]
+    if not base_warn and not base_fail:
+        headline_bits.append(f"<b>{_h.escape(cluster_name)}</b> is fully healthy — all {n_svc} services STARTED + GOOD.")
     else:
-        headline_bits.append(f"<b>{_h.escape(cm.get('cluster_name',''))}</b> reports <b>{fail_n} FAIL(s)</b> and {warn_n} WARN(s) — investigate.")
+        parts = []
+        if base_fail: parts.append(f"<b>{len(base_fail)} FAIL</b> ({', '.join(_h.escape(s['name']) for s in base_fail)})")
+        if base_warn: parts.append(f"<b>{len(base_warn)} WARN</b> ({', '.join(_h.escape(s['name']) for s in base_warn)})")
+        headline_bits.append(f"<b>{_h.escape(cluster_name)}</b>: {base_ok}/{n_svc} services PASS; " + "; ".join(parts) + ".")
+
+    # Data Services line — always mention if present, call out specific failed checks
+    ds = r.get("data_services", [])
+    ds_named = [s for s in ds if "name" in s]
+    if ds_named:
+        ds_issues = []
+        for s in ds_named:
+            if s.get("verdict") in ("WARN","FAIL"):
+                fcs = ", ".join(f['name'] for f in s.get("failed_checks", []))
+                ds_issues.append(f"<code>{_h.escape(s['name'])}</code>" + (f" ({_h.escape(fcs)})" if fcs else ""))
+        ds_label = cm.get("data_services_cluster","ECS")
+        ds_ver = cm.get("data_services_version")
+        ds_name = f"<b>{_h.escape(ds_label)}</b>" + (f" (PvC {_h.escape(ds_ver)})" if ds_ver else "")
+        if ds_issues:
+            headline_bits.append(f"{ds_name} has {_h.escape(ds[0]['health'].lower()) if ds else ''} checks on " + ", ".join(ds_issues) + ".")
+        else:
+            headline_bits.append(f"{ds_name} Data Services are all GOOD.")
+
+    # Host utilization line with peak host name
     if r.get("hosts"):
-        max_cpu = max((h.get("cpu_pct") or 0) for h in r["hosts"])
-        max_mem = max((h.get("mem_pct") or 0) for h in r["hosts"])
-        headline_bits.append(f"Host CPU max {max_cpu:.1f}%, RAM max {max_mem:.1f}%.")
+        peak_cpu = max(r["hosts"], key=lambda h: h.get("cpu_pct") or 0)
+        peak_mem = max(r["hosts"], key=lambda h: h.get("mem_pct") or 0)
+        headline_bits.append(
+            f"Host CPU max {(peak_cpu.get('cpu_pct') or 0):.1f}% ({_h.escape(peak_cpu['host'].split('.')[0])}), "
+            f"RAM max {(peak_mem.get('mem_pct') or 0):.1f}% ({_h.escape(peak_mem['host'].split('.')[0])})."
+        )
     # Disk roll-ups (per-host totals only, to avoid double-counting mounts)
     disk_totals = [d for d in r.get("disks",[]) if d.get("mount") == "(total all mounts)"]
     disk_peak_pct  = max((d.get("pct") or 0) for d in disk_totals) if disk_totals else None
@@ -192,8 +222,23 @@ def html_report(r: dict) -> str:
             f"Cluster disk: {cluster_disk_used:,.0f} / {cluster_disk_total:,.0f} GB used "
             f"({cluster_disk_pct:.1f}%); peak host {disk_peak_pct:.1f}%."
         )
-    if cm.get("kerberos_enabled"):
-        headline_bits.append("Kerberos: ENABLED.")
+    # CLI context: count "likely disabled plaintext" fails vs real fails
+    cli = r.get("cli_tests", [])
+    cli_plain_disabled = sum(1 for t in cli if t["verdict"]=="FAIL" and
+                             ("Connection refused" in t.get("detail","") and
+                              any(p in t.get("test","") for p in ("9092","9870","8088","10001","8080","8983","9874","9878","8985"))))
+    cli_real_fail = sum(1 for t in cli if t["verdict"]=="FAIL") - cli_plain_disabled
+    if cli:
+        bits = [f"CLI/endpoint probes: {sum(1 for t in cli if t['verdict']=='PASS')} PASS"]
+        if cli_real_fail:     bits.append(f"{cli_real_fail} FAIL")
+        if cli_plain_disabled: bits.append(f"{cli_plain_disabled} expected-plaintext-disabled (TLS counterparts PASS)")
+        headline_bits.append(", ".join(bits) + ".")
+
+    sec = []
+    if cm.get("kerberos_enabled"): sec.append("Kerberos: ENABLED")
+    if cm.get("auto_tls_enabled"): sec.append("AutoTLS: ENABLED")
+    if sec: headline_bits.append(" · ".join(sec) + ".")
+
     headline = " ".join(headline_bits)
     # KPI helpers for disk
     def _kpi_class(pct):
@@ -260,6 +305,14 @@ footer{{margin-top:40px;padding:20px;text-align:center;color:#94a3b8;font-size:1
   <div class="kpi {disk_peak_cls}"><div class="label">Disk Peak Host</div><div class="val">{f'{disk_peak_pct:.1f}%' if disk_peak_pct is not None else 'n/a'}</div></div>
 </div>
 <div class="info"><b>Summary:</b> {headline}</div>
+
+<h2>Management URLs</h2>
+<table><thead><tr><th style="width:220px">Target</th><th>URL</th></tr></thead>
+<tbody>{''.join(f'<tr><td>{_h.escape(u["label"])}</td><td><a href="{_h.escape(u["url"])}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:none">{_h.escape(u["url"])}</a></td></tr>' for u in r.get('management_urls', [])) or '<tr><td colspan=2>—</td></tr>'}</tbody></table>
+
+<h2>Component Versions (activated parcels)</h2>
+<table><thead><tr><th>Product</th><th>Version</th><th>Stage</th></tr></thead>
+<tbody>{''.join(f'<tr><td>{_h.escape(p["product"] or "")}</td><td><code>{_h.escape(p["version"] or "")}</code></td><td>{_h.escape(p["stage"] or "")}</td></tr>' for p in r.get('parcels', [])) or '<tr><td colspan=3>No parcel info returned by CM.</td></tr>'}</tbody></table>
 <h2>1. {_h.escape(run.get('cluster',''))} — Service Health (via CM API)</h2>
 <table><thead><tr><th>Service</th><th>Type</th><th>State</th><th>Health</th><th>Verdict</th><th>URLs</th><th>Roles</th></tr></thead>
 <tbody>{''.join(svc_row(s) for s in r.get('base_cluster_services',[]))}</tbody></table>

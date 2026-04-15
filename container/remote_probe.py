@@ -181,44 +181,53 @@ for h, m in sorted(host_rows.items()):
     hosts_out.append({"host":h, "cpu_pct":cpu, "mem_pct":mem_pct, "verdict":verdict})
 
 # ---------------------------------------------------------------------------
-# Disk utilization (per host/mount via FILESYSTEM-category timeseries)
+# Disk utilization — query each metric individually (same pattern as CPU/RAM)
+# Tries several known metric name sets. Emits per-mount rows plus per-host
+# totals with mount="(total all mounts)".
 # ---------------------------------------------------------------------------
 disk_rows = []
 GB = 1024**3
-try:
-    queries = [
-        "select total_bytes_on_filesystem, bytes_used_on_filesystem where category=FILESYSTEM",
-        "select capacity, capacity_used where category=FILESYSTEM",
-    ]
-    raw = {}
-    for q in queries:
-        try:
-            r = get(f"/api/v51/timeseries?query={quote(q)}")
-        except Exception:
-            continue
+
+def _disk_ts(metric, category="FILESYSTEM"):
+    """Return {entityName: value} for the last datapoint of `metric`."""
+    out = {}
+    try:
+        r = get(f"/api/v51/timeseries?query={quote(f'select {metric} where category={category}')}")
         for item in r.get("items", []):
             for ts in item.get("timeSeries", []):
-                meta = ts["metadata"]
+                meta  = ts["metadata"]
                 attrs = meta.get("attributes", {}) or {}
                 host  = attrs.get("hostname") or attrs.get("hostId") or meta.get("entityName","?")
-                mount = attrs.get("mountpoint") or attrs.get("mountPoint") or attrs.get("filesystemType") or "?"
-                metric = meta["metricName"]
-                data = ts.get("data", [])
+                mount = attrs.get("mountpoint") or attrs.get("mountPoint") or "?"
+                data  = ts.get("data", [])
                 if data:
-                    raw.setdefault((host, mount), {})[metric] = data[-1]["value"]
-        if raw: break  # first query that yielded data wins
+                    key = (host, mount) if category == "FILESYSTEM" else host
+                    out[key] = data[-1]["value"]
+    except Exception as e:
+        log(f"disk ts {metric}/{category}: {e}")
+    return out
 
-    # Resolve hostId -> hostname when needed
+try:
     by_id = {h["hostId"]: h["hostname"] for h in all_hosts.values()}
 
-    # Per-mount rows
-    per_host_total = {}
-    per_host_used  = {}
-    for (host, mount), m in sorted(raw.items()):
+    # 1) FILESYSTEM category (per-mount)
+    tried_pairs = [
+        ("total_bytes_on_filesystem", "bytes_used_on_filesystem"),
+        ("total_capacity",            "capacity_used"),
+        ("capacity",                  "capacity_used"),
+    ]
+    fs_total = {}; fs_used = {}
+    for t_metric, u_metric in tried_pairs:
+        fs_total = _disk_ts(t_metric, "FILESYSTEM")
+        fs_used  = _disk_ts(u_metric, "FILESYSTEM")
+        if fs_total and fs_used: break
+
+    per_host_total = {}; per_host_used = {}
+    for key, total in sorted(fs_total.items()):
+        used = fs_used.get(key)
+        if used is None or not total: continue
+        host, mount = key
         if host in by_id: host = by_id[host]
-        total = m.get("total_bytes_on_filesystem") or m.get("capacity")
-        used  = m.get("bytes_used_on_filesystem")  or m.get("capacity_used")
-        if not total or used is None: continue
         pct = used/total*100
         verdict = "PASS" if pct < 85 else ("WARN" if pct < 95 else "FAIL")
         disk_rows.append({"host":host, "mount":mount,
@@ -227,8 +236,6 @@ try:
                           "pct": round(pct,1), "verdict":verdict})
         per_host_total[host] = per_host_total.get(host,0) + total
         per_host_used[host]  = per_host_used.get(host,0)  + used
-
-    # Per-host roll-up appended at end (mount="* total *")
     for host in sorted(per_host_total):
         t, u = per_host_total[host], per_host_used[host]
         if not t: continue
@@ -238,37 +245,43 @@ try:
                           "used_gb":round(u/GB,1), "total_gb":round(t/GB,1),
                           "pct":round(pct,1), "verdict":verdict})
 
-    # Fallback: if FILESYSTEM gave nothing, use HOST-category aggregate metrics
+    # 2) Fallback: HOST-category aggregate metrics (across-disks)
     if not disk_rows:
-        for q in (
-            "select total_disk_space_across_disks, disk_space_used_across_disks where category=HOST",
-            "select bytes_total_across_disks, bytes_used_across_disks where category=HOST",
+        for t_metric, u_metric in (
+            ("total_disk_space_across_disks", "disk_space_used_across_disks"),
+            ("bytes_total_across_disks",      "bytes_used_across_disks"),
+            ("total_capacity_across_disks",   "capacity_used_across_disks"),
         ):
-            try:
-                r = get(f"/api/v51/timeseries?query={quote(q)}")
-            except Exception:
-                continue
-            agg = {}
-            for item in r.get("items", []):
-                for ts in item.get("timeSeries", []):
-                    host = ts["metadata"].get("entityName","?")
-                    metric = ts["metadata"]["metricName"]
-                    data = ts.get("data", [])
-                    if data:
-                        agg.setdefault(host,{})[metric] = data[-1]["value"]
-            for h, m in sorted(agg.items()):
-                t = m.get("total_disk_space_across_disks") or m.get("bytes_total_across_disks")
-                u = m.get("disk_space_used_across_disks")  or m.get("bytes_used_across_disks")
-                if not t or u is None: continue
-                pct = u/t*100
+            tt = _disk_ts(t_metric, "HOST")
+            uu = _disk_ts(u_metric, "HOST")
+            if not tt or not uu: continue
+            for h, total in sorted(tt.items()):
+                used = uu.get(h)
+                if used is None or not total: continue
+                if h in by_id: h = by_id[h]
+                pct = used/total*100
                 verdict = "PASS" if pct < 85 else ("WARN" if pct < 95 else "FAIL")
-                disk_rows.append({"host":h, "mount":"(host aggregate)",
-                                  "used_gb":round(u/GB,1), "total_gb":round(t/GB,1),
-                                  "pct":round(pct,1), "verdict":verdict})
                 disk_rows.append({"host":h, "mount":"(total all mounts)",
-                                  "used_gb":round(u/GB,1), "total_gb":round(t/GB,1),
+                                  "used_gb":round(used/GB,1),
+                                  "total_gb":round(total/GB,1),
                                   "pct":round(pct,1), "verdict":verdict})
             if disk_rows: break
+
+    # 3) Last resort: HDFS cluster capacity (at least gives cluster-wide storage)
+    if not disk_rows:
+        try:
+            hdfs_cap   = _disk_ts("dfs_capacity", "SERVICE")
+            hdfs_used  = _disk_ts("dfs_capacity_used", "SERVICE")
+            for svc, total in hdfs_cap.items():
+                used = hdfs_used.get(svc)
+                if used is None or not total: continue
+                pct = used/total*100
+                verdict = "PASS" if pct < 85 else ("WARN" if pct < 95 else "FAIL")
+                disk_rows.append({"host":"(cluster HDFS)", "mount":"(total all mounts)",
+                                  "used_gb":round(used/GB,1),
+                                  "total_gb":round(total/GB,1),
+                                  "pct":round(pct,1), "verdict":verdict})
+        except Exception: pass
 except Exception as e:
     log(f"disk probe: {e}")
 
@@ -286,6 +299,18 @@ try:
         if n in ("AUTO_TLS_TYPE","AGENT_TLS","NEED_AGENT_VALIDATION") and v not in (None,"NONE","false","disabled"):
             auto_tls_enabled = True
 except Exception: pass
+
+# Activated parcels — gives per-component minor versions (CDH, FLOOD, DATAVIZ, etc.)
+parcels = []
+try:
+    p = get(f"/api/v51/clusters/{CLUSTER}/parcels?view=summary")
+    for it in p.get("items", []):
+        if it.get("stage") == "ACTIVATED":
+            parcels.append({"product": it.get("product"),
+                             "version": it.get("version"),
+                             "stage":   it.get("stage")})
+except Exception as e:
+    log(f"parcels: {e}")
 
 all_hosts = {h["hostId"]:h for h in get("/api/v51/hosts").get("items", [])}
 ip_by_hostname = {h["hostname"]: h["ipAddress"] for h in all_hosts.values()}
@@ -472,6 +497,16 @@ if sample_host:
 # ---------------------------------------------------------------------------
 # Emit
 # ---------------------------------------------------------------------------
+# Management URLs (CM + Knox)
+mgmt_urls = [
+    {"label": "Cloudera Manager",  "url": f"https://{CM_HOST}:{CM_PORT}/cmf/home"},
+    {"label": "Cloudera Manager API", "url": f"https://{CM_HOST}:{CM_PORT}/api/{api_version or 'v51'}"},
+]
+knox_host = _first(endpoints.get("KNOX", []))
+if knox_host:
+    mgmt_urls.append({"label": "Knox Gateway (admin)", "url": f"https://{knox_host}:8443/gateway/admin/"})
+    mgmt_urls.append({"label": "Knox Gateway (home)",  "url": f"https://{knox_host}:8443/gateway/homepage/home/"})
+
 out = {
     "cm": {"api_version": api_version, "cm_version": cm_v.get("version"),
            "cdp_version": target.get("fullVersion"),
@@ -480,6 +515,8 @@ out = {
            "data_services_version": data_services_version,
            "kerberos_enabled": kerberos_enabled,
            "auto_tls_enabled": auto_tls_enabled},
+    "parcels": parcels,
+    "management_urls": mgmt_urls,
     "base_cluster_services": svc_results,
     "data_services": ds_results,
     "hosts": hosts_out,
