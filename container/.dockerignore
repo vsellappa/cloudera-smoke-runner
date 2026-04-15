@@ -1,0 +1,8 @@
+output/
+*.env.local
+.smoke.env
+__pycache__/
+*.pyc
+.git
+.gitignore
+.DS_Store

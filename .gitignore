@@ -1,0 +1,33 @@
+# Generated reports / artifacts
+output/
+container/output/
+smoke-test-*.json
+smoke-test-*.html
+smoke-test-*.nagios
+smoke-test-*.prom
+smoke-*.json
+smoke-*.html
+smoke-*.nagios
+smoke-*.prom
+
+# Local config (may contain secrets)
+.smoke.env
+container/.smoke.env
+*.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Tooling
+.claude/
